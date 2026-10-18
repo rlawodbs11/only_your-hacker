@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>secure-shell</title>
+<style>
+  :root {
+    --bg: #010702;
+    --fg: #33ff66;
+    --dim: #1d7a36;
+    --warn: #ffcc33;
+    --alert: #ff4444;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font-family: "Courier New", Consolas, "Roboto Mono", monospace;
+    overflow-x: hidden;
+  }
+  body::after { /* 은은한 스캔라인 */
+    content: ""; position: fixed; inset: 0; pointer-events: none;
+    background: repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px);
+  }
+  .terminal {
+    height: 100%; max-width: 680px; margin: 0 auto;
+    padding: 12px 12px 16px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .header {
+    display: flex; justify-content: space-between;
+    font-size: 11px; color: var(--dim);
+    border-bottom: 1px solid var(--dim); padding-bottom: 6px;
+  }
+  #log {
+    flex: 1; overflow-y: auto; overflow-x: hidden;
+    font-size: 13px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-all;
+    text-shadow: 0 0 4px rgba(51,255,102,.45);
+  }
+  #log .dim   { color: var(--dim); }
+  #log .warn  { color: var(--warn); text-shadow: 0 0 4px rgba(255,204,51,.5); }
+  #log .alert { color: var(--alert); text-shadow: 0 0 4px rgba(255,68,68,.6); font-weight: bold; }
+  #log .ok    { color: var(--fg); font-weight: bold; }
+  .cursor::after { content: "▌"; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .status { font-size: 12px; }
+  .status-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .bar { height: 10px; border: 1px solid var(--dim); }
+  #bar-fill { height: 100%; width: 0; background: var(--fg); transition: width .3s; }
+
+  .glitch { animation: glitch .12s steps(2) 6; }
+  @keyframes glitch {
+    0%   { transform: translate(0); filter: none; }
+    50%  { transform: translate(-3px, 1px); filter: hue-rotate(90deg); }
+    100% { transform: translate(2px, -1px); }
+  }
+
+  #reveal {
+    display: none; position: fixed; inset: 0;
+    background: var(--bg);
+    overflow-y: auto;
+    padding: 24px; text-align: center;
+  }
+  #reveal.show { display: flex; animation: fade .6s ease-out; }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  .reveal-box {
+    max-width: 420px; width: 100%; margin: auto;
+    border: 1px solid var(--fg); padding: 24px 18px;
+    box-shadow: 0 0 20px rgba(51,255,102,.35);
+  }
+  .reveal-box h1 { font-size: 22px; margin: 0 0 16px; letter-spacing: 2px; }
+  .reveal-box p  { margin: 8px 0; line-height: 1.6; font-size: 15px; }
+  .reveal-box .note { margin-top: 18px; font-size: 12px; color: var(--dim); }
+  #replay {
+    margin-top: 20px; width: 100%; min-height: 48px;
+    background: transparent; color: var(--fg);
+    border: 1px solid var(--fg); font: inherit; font-size: 15px; cursor: pointer;
+  }
+  #replay:active { background: var(--dim); }
+  .meme { display: block; max-width: 45%; max-height: 18vh; margin: 14px auto 0; border-radius: 8px; }
+  #download {
+    display: flex; align-items: center; justify-content: center;
+    margin-top: 14px; min-height: 48px;
+    background: var(--fg); color: var(--bg); font-weight: bold;
+    text-decoration: none; font-size: 15px;
+  }
+</style>
+</head>
+<body>
+<main class="terminal" id="terminal">
+  <div class="header">
+    <span>ssh://node-07 · tty1</span>
+    <span id="clock">--:--:--</span>
+  </div>
+  <div id="log" class="cursor" aria-live="polite"></div>
+  <div class="status">
+    <div class="status-row"><span id="phase">IDLE</span><span id="percent">0%</span></div>
+    <div class="bar"><div id="bar-fill"></div></div>
+  </div>
+</main>
+
+<section id="reveal" aria-live="polite">
+  <div class="reveal-box">
+    <h1 id="reveal-title"></h1>
+    <div id="reveal-body"></div>
+    <a id="download" href="image.png" download="meme.png">⬇ 이미지 저장하기</a>
+    <p class="note" id="reveal-note"></p>
+    <button id="replay" type="button">↻ 다시 보기</button>
+  </div>
+</section>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ================= 설정 영역 =================
+   * 모든 로그는 미리 작성된 가상 텍스트입니다.
+   * 실제 기기·네트워크 정보는 읽거나 전송하지 않습니다.
+   * type: 'type'(한 글자씩) | 'line'(즉시 출력) | 'dump'(가짜 데이터 빠르게 출력)
+   * cls : 'dim' | 'warn' | 'alert' | 'ok'
+   * ============================================ */
+  const CONFIG = {
+    typeDelayMs: 18,
+    lineDelayMs: 90,
+    dumpLineDelayMs: 25,
+    stepPauseMs: 350,
+    phases: [
+      { name: 'INIT', progress: 8, lines: [
+        { type: 'type', text: '$ ./uplink --target session-4F2A --mode passive' },
+        { type: 'line', cls: 'dim', text: '[ 0.000] uplink v3.8.1 loaded' },
+        { type: 'line', cls: 'dim', text: '[ 0.014] crypto backend: chacha20-poly1305' },
+        { type: 'line', cls: 'dim', text: '[ 0.031] proxy chain: 3 hops established' },
+      ]},
+      { name: 'HANDSHAKE', progress: 22, lines: [
+        { type: 'type', text: '> negotiating session...' },
+        { type: 'line', text: '  SYN  -> 198.51.100.23:443' },
+        { type: 'line', text: '  ACK  <- 198.51.100.23:443' },
+        { type: 'line', cls: 'ok', text: '  session token accepted' },
+      ]},
+      { name: 'ENUMERATE', progress: 40, lines: [
+        { type: 'type', text: '> enumerating mailbox index...' },
+        { type: 'dump', count: 14 },
+        { type: 'line', cls: 'warn', text: '  [!] anomaly: 2,147 inbound messages in 00:04:12' },
+        { type: 'line', cls: 'warn', text: '  [!] source pattern matches known sender' },
+      ]},
+      { name: 'TRACE', progress: 58, lines: [
+        { type: 'type', text: '> tracing origin of bulk traffic...' },
+        { type: 'line', text: '  hop 1  203.0.113.8     12ms' },
+        { type: 'line', text: '  hop 2  203.0.113.41    19ms' },
+        { type: 'line', text: '  hop 3  192.0.2.117     27ms' },
+        { type: 'line', cls: 'ok', text: '  origin resolved.' },
+      ]},
+      { name: 'ANALYZE', progress: 76, lines: [
+        { type: 'type', text: '> cross-referencing behavioral profile...' },
+        { type: 'dump', count: 10 },
+        { type: 'line', text: '  confidence ............. 99.2%' },
+        { type: 'line', text: '  motive ................. "funnyyyyyyyyyyyyyyyyy"' },
+        { type: 'line', text: '  remorse ................ not detected' },
+      ]},
+      { name: 'COUNTERMEASURE', progress: 94, lines: [
+        { type: 'type', text: '> preparing countermeasure payload...' },
+        { type: 'line', cls: 'alert', text: '  [!!] WARNING: irreversible operation' },
+        { type: 'line', cls: 'alert', text: '  [!!] executing in 3...' },
+        { type: 'line', cls: 'alert', text: '  [!!] executing in 2...' },
+        { type: 'line', cls: 'alert', text: '  [!!] executing in 1...' },
+      ]},
+      { name: 'DONE', progress: 100, lines: [] },
+    ],
+    reveal: {
+      title: '— 메일폭탄 잘 받았다 서우야 —',
+      lines: [
+        '방금 본 화면은 전부 연출이야. 아마도?',
+        '근데 심장은 좀 뛰었지? 그걸로 쌤쌤.',
+      ],
+      note: '※ 이 페이지는 가상 시뮬레이션입니다. 아마도?',
+    },
+  };
+  /* ============================================ */
+
+  const $ = id => document.getElementById(id);
+  const logEl = $('log'), barFill = $('bar-fill'), percentEl = $('percent'),
+        phaseEl = $('phase'), terminal = $('terminal'), reveal = $('reveal');
+
+  let runId = 0;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const alive = id => id === runId;
+
+  // 시계 (화면 장식용)
+  setInterval(() => { $('clock').textContent = new Date().toTimeString().slice(0, 8); }, 1000);
+
+  function addLine(cls) {
+    const el = document.createElement('div');
+    if (cls) el.className = cls;
+    logEl.appendChild(el);
+    logEl.scrollTop = logEl.scrollHeight;
+    return el;
+  }
+
+  function fakeHexLine() {
+    const hex = () => Math.floor(Math.random() * 256).toString(16).padStart(2, '0');
+    const addr = Math.floor(Math.random() * 0xffff).toString(16).padStart(4, '0');
+    return '  0x' + addr + '  ' + Array.from({ length: 8 }, hex).join(' ');
+  }
+
+  async function render(item, id) {
+    if (item.type === 'type') {
+      const el = addLine(item.cls);
+      for (const ch of item.text) {
+        if (!alive(id)) return false;
+        el.textContent += ch;
+        await sleep(CONFIG.typeDelayMs);
+      }
+    } else if (item.type === 'dump') {
+      for (let i = 0; i < item.count; i++) {
+        if (!alive(id)) return false;
+        addLine('dim').textContent = fakeHexLine();
+        await sleep(CONFIG.dumpLineDelayMs);
+      }
+    } else {
+      addLine(item.cls).textContent = item.text;
+      await sleep(CONFIG.lineDelayMs);
+    }
+    return alive(id);
+  }
+
+  function setProgress(name, value) {
+    phaseEl.textContent = name;
+    barFill.style.width = value + '%';
+    percentEl.textContent = value + '%';
+  }
+
+  function showReveal() {
+    const r = CONFIG.reveal;
+    $('reveal-title').textContent = r.title;
+    const body = $('reveal-body');
+    body.textContent = '';
+    r.lines.forEach(t => { const p = document.createElement('p'); p.textContent = t; body.appendChild(p); });
+    $('reveal-note').textContent = r.note;
+    reveal.classList.add('show');
+  }
+
+  async function run() {
+    const id = ++runId;
+    reveal.classList.remove('show');
+    logEl.textContent = '';
+    setProgress('INIT', 0);
+
+    for (const phase of CONFIG.phases) {
+      for (const item of phase.lines) {
+        if (!(await render(item, id))) return;
+      }
+      setProgress(phase.name, phase.progress);
+      await sleep(CONFIG.stepPauseMs);
+      if (!alive(id)) return;
+    }
+
+    terminal.classList.remove('glitch');
+    void terminal.offsetWidth;          // 애니메이션 재시작
+    terminal.classList.add('glitch');
+    await sleep(900);
+    if (alive(id)) showReveal();
+  }
+
+  $('replay').addEventListener('click', run);
+  run();
+})();
+</script>
+</body>
+</html>
